@@ -175,11 +175,71 @@ struct Fruit {
             return
         }
 
-        for device in devices {
-            let marker = device.isBooted ? "booted" : "shutdown"
-            print("\(device.name) (\(device.runtime), \(marker))")
-            print("  \(device.udid)")
+        let phones = devices.filter { $0.name.hasPrefix("iPhone") }
+        let tablets = devices.filter { $0.name.hasPrefix("iPad") }
+        let others = devices.filter { !$0.name.hasPrefix("iPhone") && !$0.name.hasPrefix("iPad") }
+
+        print("Available Simulators")
+
+        if !phones.isEmpty {
+            printDeviceTable(title: "iPhone", devices: phones)
         }
+        if !tablets.isEmpty {
+            printDeviceTable(title: "iPad", devices: tablets)
+        }
+        if !others.isEmpty {
+            printDeviceTable(title: "Other", devices: others)
+        }
+
+        let suggestedDevice = phones.first ?? devices[0]
+        print("")
+        print("Select by name or UDID:")
+        print("  fruit device \"\(suggestedDevice.name)\"")
+        print("  fruit device \(suggestedDevice.udid)")
+    }
+
+    private func printDeviceTable(title: String, devices: [Device]) {
+        print("")
+        print(title)
+
+        let nameWidth = maxColumnWidth(header: "Name", values: devices.map(\.name))
+        let runtimeWidth = maxColumnWidth(header: "Runtime", values: devices.map(\.runtime))
+        let stateWidth = maxColumnWidth(header: "State", values: devices.map { displayState($0.state) })
+
+        print(
+            "  "
+            + pad("Name", to: nameWidth)
+            + "  "
+            + pad("Runtime", to: runtimeWidth)
+            + "  "
+            + pad("State", to: stateWidth)
+            + "  UDID"
+        )
+
+        for device in devices {
+            print(
+                "  "
+                + pad(device.name, to: nameWidth)
+                + "  "
+                + pad(device.runtime, to: runtimeWidth)
+                + "  "
+                + pad(displayState(device.state), to: stateWidth)
+                + "  "
+                + device.udid
+            )
+        }
+    }
+
+    private func maxColumnWidth(header: String, values: [String]) -> Int {
+        max(([header] + values).map(\.count).max() ?? header.count, header.count)
+    }
+
+    private func pad(_ value: String, to width: Int) -> String {
+        value + String(repeating: " ", count: max(0, width - value.count))
+    }
+
+    private func displayState(_ state: String) -> String {
+        state == "Booted" ? "booted" : "shutdown"
     }
 
     private func printCurrentDevice() throws {
