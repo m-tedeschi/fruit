@@ -17,18 +17,6 @@ Fruit discovers the current `.xcworkspace` or `.xcodeproj`, resolves the scheme,
 selected simulator, boots the simulator if needed, reinstalls the app, and
 launches it.
 
-The command describes intent rather than Apple tooling mechanics:
-
-```sh
-fruit run
-```
-
-means:
-
-```text
-Build this app and run it on my selected simulator.
-```
-
 ## Features
 
 - List available iOS simulators
@@ -60,6 +48,7 @@ cd fruit
 Run the installer:
 
 ```sh
+chmod +x install.sh
 ./install.sh
 ```
 
@@ -142,7 +131,6 @@ or exactly one `.xcodeproj` in the current directory tree.
 
 ## Future Improvements
 
-- Improve `fruit devices` output with a compact, readable table
 - Improve build failure summaries
 - Add `fruit logs` for streaming logs from the launched app
 - Add explicit simulator controls such as boot, shutdown, and uninstall
