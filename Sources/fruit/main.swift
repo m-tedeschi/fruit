@@ -28,31 +28,64 @@ enum FruitError: Error, CustomStringConvertible {
     }
 }
 
+final class ProcessOutput: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "fruit.process.output")
+    private var stdoutData = Data()
+    private var stderrData = Data()
+    private let printOutput: Bool
+    private let outputHandle: FileHandle?
+
+    init(printOutput: Bool, outputHandle: FileHandle?) {
+        self.printOutput = printOutput
+        self.outputHandle = outputHandle
+    }
+
+    func appendStdout(_ data: Data) {
+        queue.sync {
+            stdoutData.append(data)
+            if printOutput {
+                FileHandle.standardOutput.write(data)
+            }
+            outputHandle?.write(data)
+        }
+    }
+
+    func appendStderr(_ data: Data) {
+        queue.sync {
+            stderrData.append(data)
+            if printOutput {
+                FileHandle.standardError.write(data)
+            }
+            outputHandle?.write(data)
+        }
+    }
+
+    func result(status: Int32) -> CommandResult {
+        queue.sync {
+            CommandResult(
+                status: status,
+                stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+                stderr: String(data: stderrData, encoding: .utf8) ?? ""
+            )
+        }
+    }
+}
+
 struct Shell {
     static func run(_ arguments: [String], printCommand: Bool = false) throws -> CommandResult {
-        if printCommand {
-            print(arguments.map(quote).joined(separator: " "))
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = arguments
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-
-        return CommandResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
+        try execute(arguments, printCommand: printCommand, printOutput: false, outputFile: nil)
     }
 
     static func stream(_ arguments: [String], outputFile: URL? = nil, printCommand: Bool = true) throws -> Int32 {
+        try execute(arguments, printCommand: printCommand, printOutput: true, outputFile: outputFile).status
+    }
+
+    static func execute(
+        _ arguments: [String],
+        printCommand: Bool = false,
+        printOutput: Bool = false,
+        outputFile: URL? = nil
+    ) throws -> CommandResult {
         let outputHandle: FileHandle?
         if let outputFile {
             FileManager.default.createFile(atPath: outputFile.path, contents: nil)
@@ -64,9 +97,13 @@ struct Shell {
             try? outputHandle?.close()
         }
 
-        if printCommand {
+        let output = ProcessOutput(printOutput: printOutput, outputHandle: outputHandle)
+
+        if printCommand || outputHandle != nil {
             let command = commandLine(arguments) + "\n"
-            print(command, terminator: "")
+            if printCommand {
+                print(command, terminator: "")
+            }
             if let data = command.data(using: .utf8) {
                 outputHandle?.write(data)
             }
@@ -76,27 +113,42 @@ struct Shell {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = arguments
 
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = outputPipe
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
-        let writeQueue = DispatchQueue(label: "fruit.stream.output")
-        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else {
                 return
             }
-            writeQueue.sync {
-                FileHandle.standardOutput.write(data)
-                outputHandle?.write(data)
+            output.appendStdout(data)
+        }
+
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                return
             }
+            output.appendStderr(data)
         }
 
         try process.run()
         process.waitUntilExit()
-        outputPipe.fileHandleForReading.readabilityHandler = nil
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
 
-        return process.terminationStatus
+        let remainingStdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let remainingStderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remainingStdout.isEmpty {
+            output.appendStdout(remainingStdout)
+        }
+        if !remainingStderr.isEmpty {
+            output.appendStderr(remainingStderr)
+        }
+
+        return output.result(status: process.terminationStatus)
     }
 
     static func commandLine(_ arguments: [String]) -> String {
@@ -697,21 +749,13 @@ struct Fruit {
             "build"
         ]
 
-        if options.verbose {
-            let status = try Shell.stream(arguments, outputFile: outputFile)
-            if let outputFile {
-                print("Saved build log to \(relativePath(outputFile, from: context.root))")
-            }
-            guard status == 0 else {
-                throw FruitError.message("build failed with exit code \(status)")
-            }
-            print("Build succeeded.")
-            return
-        }
-
-        let result = try Shell.run(arguments)
+        let result = try Shell.execute(
+            arguments,
+            printCommand: options.verbose,
+            printOutput: options.verbose,
+            outputFile: outputFile
+        )
         if let outputFile {
-            try writeBuildLog(result: result, arguments: arguments, to: outputFile)
             print("Saved build log to \(relativePath(outputFile, from: context.root))")
         }
 
@@ -732,20 +776,6 @@ struct Fruit {
         let parent = url.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         return url
-    }
-
-    private func writeBuildLog(result: CommandResult, arguments: [String], to outputFile: URL) throws {
-        var output = Shell.commandLine(arguments) + "\n"
-        if !result.stdout.isEmpty {
-            output += result.stdout
-        }
-        if !result.stderr.isEmpty {
-            if !output.hasSuffix("\n") {
-                output += "\n"
-            }
-            output += result.stderr
-        }
-        try output.write(to: outputFile, atomically: true, encoding: .utf8)
     }
 
     private func buildFailureMessage(_ result: CommandResult) -> String {
