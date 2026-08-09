@@ -789,7 +789,7 @@ struct Fruit {
         }
 
         guard result.succeeded else {
-            throw FruitError.message(buildFailureMessage(result))
+            throw FruitError.message(buildFailureMessage(result, context: context))
         }
 
         print(TerminalColor.green("Build succeeded."))
@@ -807,7 +807,7 @@ struct Fruit {
         return url
     }
 
-    private func buildFailureMessage(_ result: CommandResult) -> String {
+    private func buildFailureMessage(_ result: CommandResult, context: ProjectContext) -> String {
         let output = [result.stdout, result.stderr]
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n")
@@ -815,20 +815,20 @@ struct Fruit {
         let lines = output.components(separatedBy: .newlines)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-        let diagnostics = buildDiagnostics(from: lines)
+        let diagnostics = buildDiagnostics(from: lines, context: context)
         if !diagnostics.errors.isEmpty || !diagnostics.warnings.isEmpty {
             var sections: [String] = [TerminalColor.red("Build failed.")]
 
             if !diagnostics.errors.isEmpty {
                 sections.append("")
                 sections.append(TerminalColor.bold("Errors"))
-                sections.append(contentsOf: diagnostics.errors.map { "  " + TerminalColor.red($0) })
+                sections.append(diagnostics.errors.map { formattedDiagnostic($0, color: .red) }.joined(separator: "\n\n"))
             }
 
             if !diagnostics.warnings.isEmpty {
                 sections.append("")
                 sections.append(TerminalColor.bold("Warnings"))
-                sections.append(contentsOf: diagnostics.warnings.map { "  " + TerminalColor.yellow($0) })
+                sections.append(diagnostics.warnings.map { formattedDiagnostic($0, color: .yellow) }.joined(separator: "\n\n"))
             }
 
             return sections.joined(separator: "\n")
@@ -842,7 +842,7 @@ struct Fruit {
         return TerminalColor.red("Build failed.") + "\n" + tail
     }
 
-    private func buildDiagnostics(from lines: [String]) -> (errors: [String], warnings: [String]) {
+    private func buildDiagnostics(from lines: [String], context: ProjectContext) -> (errors: [String], warnings: [String]) {
         var errors: [String] = []
         var warnings: [String] = []
 
@@ -851,20 +851,19 @@ struct Fruit {
             let lowercased = trimmed.lowercased()
 
             if isBuildErrorLine(lowercased) {
-                appendDiagnostic(trimmed, to: &errors)
+                appendDiagnostic(shortenDiagnostic(trimmed, context: context), to: &errors)
             } else if isBuildWarningLine(lowercased) {
-                appendDiagnostic(trimmed, to: &warnings)
+                appendDiagnostic(shortenDiagnostic(trimmed, context: context), to: &warnings)
             }
         }
 
-        return (Array(errors.prefix(12)), Array(warnings.prefix(8)))
+        return (Array(errors.prefix(8)), Array(warnings.prefix(4)))
     }
 
     private func isBuildErrorLine(_ lowercasedLine: String) -> Bool {
         lowercasedLine.contains(": error:")
             || lowercasedLine.hasPrefix("error:")
             || lowercasedLine.contains(" error: ")
-            || lowercasedLine == "** build failed **"
             || lowercasedLine.contains("unable to open base configuration reference file")
             || lowercasedLine.contains("no such module")
             || lowercasedLine.contains("command phasescriptexecution failed")
@@ -881,6 +880,81 @@ struct Fruit {
             return
         }
         diagnostics.append(diagnostic)
+    }
+
+    private func shortenDiagnostic(_ diagnostic: String, context: ProjectContext) -> String {
+        diagnostic.replacingOccurrences(of: context.root.standardizedFileURL.path + "/", with: "")
+    }
+
+    private enum DiagnosticColor {
+        case red
+        case yellow
+    }
+
+    private func formattedDiagnostic(_ diagnostic: String, color: DiagnosticColor) -> String {
+        wrap(diagnostic, width: 80, indent: "  ")
+            .map { line in
+                switch color {
+                case .red:
+                    return TerminalColor.red(line)
+                case .yellow:
+                    return TerminalColor.yellow(line)
+                }
+            }
+            .joined(separator: "\n")
+    }
+
+    private func wrap(_ text: String, width: Int, indent: String) -> [String] {
+        let availableWidth = max(20, width - indent.count)
+        var lines: [String] = []
+        var current = ""
+
+        for word in text.split(separator: " ").map(String.init) {
+            let pieces = splitLongWord(word, width: availableWidth)
+            for piece in pieces {
+                appendWrappedWord(piece, availableWidth: availableWidth, indent: indent, lines: &lines, current: &current)
+            }
+        }
+
+        if !current.isEmpty {
+            lines.append(indent + current)
+        }
+
+        return lines.isEmpty ? [indent] : lines
+    }
+
+    private func appendWrappedWord(
+        _ word: String,
+        availableWidth: Int,
+        indent: String,
+        lines: inout [String],
+        current: inout String
+    ) {
+        if current.isEmpty {
+            current = word
+        } else if current.count + 1 + word.count <= availableWidth {
+            current += " " + word
+        } else {
+            lines.append(indent + current)
+            current = word
+        }
+    }
+
+    private func splitLongWord(_ word: String, width: Int) -> [String] {
+        guard word.count > width else {
+            return [word]
+        }
+
+        var pieces: [String] = []
+        var start = word.startIndex
+
+        while start < word.endIndex {
+            let end = word.index(start, offsetBy: width, limitedBy: word.endIndex) ?? word.endIndex
+            pieces.append(String(word[start..<end]))
+            start = end
+        }
+
+        return pieces
     }
 
     private func builtAppPath(context: ProjectContext, scheme: String) throws -> URL {
