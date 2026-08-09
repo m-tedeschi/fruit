@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-let fruitVersion = "1.0.0"
+let fruitVersion = "1.0.1"
 
 struct CommandResult {
     let status: Int32
@@ -15,6 +15,35 @@ struct BuildOptions {
     let deviceArgument: String?
     let verbose: Bool
     let outputLogName: String?
+}
+
+enum TerminalColor {
+    static let red = "\u{001B}[31m"
+    static let yellow = "\u{001B}[33m"
+    static let green = "\u{001B}[32m"
+    static let cyan = "\u{001B}[36m"
+    static let bold = "\u{001B}[1m"
+    static let reset = "\u{001B}[0m"
+
+    static func red(_ value: String) -> String {
+        red + value + reset
+    }
+
+    static func yellow(_ value: String) -> String {
+        yellow + value + reset
+    }
+
+    static func green(_ value: String) -> String {
+        green + value + reset
+    }
+
+    static func cyan(_ value: String) -> String {
+        cyan + value + reset
+    }
+
+    static func bold(_ value: String) -> String {
+        bold + value + reset
+    }
 }
 
 enum FruitError: Error, CustomStringConvertible {
@@ -763,7 +792,7 @@ struct Fruit {
             throw FruitError.message(buildFailureMessage(result))
         }
 
-        print("Build succeeded.")
+        print(TerminalColor.green("Build succeeded."))
     }
 
     private func outputLogURL(named name: String, context: ProjectContext) throws -> URL {
@@ -786,12 +815,72 @@ struct Fruit {
         let lines = output.components(separatedBy: .newlines)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-        let tail = lines.suffix(80).joined(separator: "\n")
-        if tail.isEmpty {
-            return "build failed with exit code \(result.status)"
+        let diagnostics = buildDiagnostics(from: lines)
+        if !diagnostics.errors.isEmpty || !diagnostics.warnings.isEmpty {
+            var sections: [String] = [TerminalColor.red("Build failed.")]
+
+            if !diagnostics.errors.isEmpty {
+                sections.append("")
+                sections.append(TerminalColor.bold("Errors"))
+                sections.append(contentsOf: diagnostics.errors.map { "  " + TerminalColor.red($0) })
+            }
+
+            if !diagnostics.warnings.isEmpty {
+                sections.append("")
+                sections.append(TerminalColor.bold("Warnings"))
+                sections.append(contentsOf: diagnostics.warnings.map { "  " + TerminalColor.yellow($0) })
+            }
+
+            return sections.joined(separator: "\n")
         }
 
-        return "build failed:\n\(tail)"
+        let tail = lines.suffix(80).joined(separator: "\n")
+        if tail.isEmpty {
+            return TerminalColor.red("Build failed with exit code \(result.status).")
+        }
+
+        return TerminalColor.red("Build failed.") + "\n" + tail
+    }
+
+    private func buildDiagnostics(from lines: [String]) -> (errors: [String], warnings: [String]) {
+        var errors: [String] = []
+        var warnings: [String] = []
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowercased = trimmed.lowercased()
+
+            if isBuildErrorLine(lowercased) {
+                appendDiagnostic(trimmed, to: &errors)
+            } else if isBuildWarningLine(lowercased) {
+                appendDiagnostic(trimmed, to: &warnings)
+            }
+        }
+
+        return (Array(errors.prefix(12)), Array(warnings.prefix(8)))
+    }
+
+    private func isBuildErrorLine(_ lowercasedLine: String) -> Bool {
+        lowercasedLine.contains(": error:")
+            || lowercasedLine.hasPrefix("error:")
+            || lowercasedLine.contains(" error: ")
+            || lowercasedLine == "** build failed **"
+            || lowercasedLine.contains("unable to open base configuration reference file")
+            || lowercasedLine.contains("no such module")
+            || lowercasedLine.contains("command phasescriptexecution failed")
+    }
+
+    private func isBuildWarningLine(_ lowercasedLine: String) -> Bool {
+        lowercasedLine.contains(": warning:")
+            || lowercasedLine.hasPrefix("warning:")
+            || lowercasedLine.contains(" warning: ")
+    }
+
+    private func appendDiagnostic(_ diagnostic: String, to diagnostics: inout [String]) {
+        guard !diagnostics.contains(diagnostic) else {
+            return
+        }
+        diagnostics.append(diagnostic)
     }
 
     private func builtAppPath(context: ProjectContext, scheme: String) throws -> URL {

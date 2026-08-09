@@ -103,7 +103,7 @@ Expected output:
 | `fruit clean` | Remove `.fruit/DerivedData`. |
 | `fruit open` | Open the current project in Xcode. |
 | `fruit doctor` | Check whether Fruit can build and run the current project. |
-| `fruit logs` | Omitted from version 1.0.0. |
+| `fruit logs` | Omitted from version 1.0.1. |
 
 Fruit resolves simulator devices in this order:
 
@@ -126,7 +126,7 @@ Fruit reads shared scheme files directly from the selected project or workspace
 when possible, and falls back to `xcodebuild -list` only when no shared schemes
 are found.
 
-Version 1.0.0 supports simulator devices only. It expects exactly one `.xcworkspace`
+Version 1.0.1 supports simulator devices only. It expects exactly one `.xcworkspace`
 or exactly one `.xcodeproj` in the current directory tree.
 
 ## Future Improvements
