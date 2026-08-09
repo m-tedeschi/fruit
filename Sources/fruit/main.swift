@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
 
+let fruitVersion = "1.0.0"
+
 struct CommandResult {
     let status: Int32
     let stdout: String
@@ -199,6 +201,8 @@ struct Fruit {
         switch command {
         case "help", "-h", "--help":
             printHelp()
+        case "version", "-V", "--version":
+            printVersion()
         case "devices":
             try listDevices()
         case "device":
@@ -234,9 +238,10 @@ struct Fruit {
 
     private func printHelp() {
         print("""
-        Fruit
+        Fruit \(fruitVersion)
 
         Usage:
+          fruit version            Show Fruit version
           fruit devices            List available simulators
           fruit device             Show the selected simulator
           fruit device <device>    Select a simulator by name or UDID
@@ -253,6 +258,10 @@ struct Fruit {
           fruit open               Open the project in Xcode
           fruit doctor             Check whether the project can run
         """)
+    }
+
+    private func printVersion() {
+        print("fruit \(fruitVersion)")
     }
 
     private func parseBuildOptions(_ arguments: [String]) throws -> BuildOptions {
@@ -807,18 +816,8 @@ struct Fruit {
             return device
         }
 
-        let matches = devices.filter { $0.name.lowercased() == nameOrUDID.lowercased() }
-        if matches.count == 1 {
-            return matches[0]
-        }
-
-        if let bootedMatch = matches.first(where: \.isBooted) {
-            return bootedMatch
-        }
-
-        if matches.count > 1 {
-            let choices = matches.map { "  \($0.name) (\($0.runtime))\n  \($0.udid)" }.joined(separator: "\n")
-            throw FruitError.message("multiple simulators named `\(nameOrUDID)`. Use a UDID:\n\(choices)")
+        if let match = devices.first(where: { $0.name.lowercased() == nameOrUDID.lowercased() }) {
+            return match
         }
 
         throw FruitError.message("no available simulator named `\(nameOrUDID)`. Run `fruit devices`.")
@@ -832,8 +831,9 @@ struct Fruit {
 
         let response = try JSONDecoder().decode(SimctlDevicesResponse.self, from: Data(result.stdout.utf8))
 
-        return response.devices.flatMap { runtimeIdentifier, simctlDevices in
-            simctlDevices.compactMap { simctlDevice in
+        let devices = response.devices.flatMap { entry -> [Device] in
+            let runtimeIdentifier = entry.key
+            return entry.value.compactMap { simctlDevice in
                 guard simctlDevice.isAvailable ?? true else {
                     return nil
                 }
@@ -846,12 +846,73 @@ struct Fruit {
             }
         }
         .filter { $0.runtime.hasPrefix("iOS") }
-        .sorted { left, right in
-            if left.runtime == right.runtime {
-                return left.name < right.name
+
+        return newestDevicePerName(devices)
+            .sorted(by: compareDevicesForDisplay)
+    }
+
+    private func newestDevicePerName(_ devices: [Device]) -> [Device] {
+        var selected: [String: Device] = [:]
+
+        for device in devices {
+            let key = device.name.lowercased()
+            guard let existing = selected[key] else {
+                selected[key] = device
+                continue
             }
-            return left.runtime > right.runtime
+
+            if compareDevicesForPreference(device, existing) {
+                selected[key] = device
+            }
         }
+
+        return Array(selected.values)
+    }
+
+    private func compareDevicesForPreference(_ left: Device, _ right: Device) -> Bool {
+        let runtimeComparison = compareRuntimeVersions(left.runtime, right.runtime)
+        if runtimeComparison != 0 {
+            return runtimeComparison > 0
+        }
+
+        if left.isBooted != right.isBooted {
+            return left.isBooted
+        }
+
+        return left.udid < right.udid
+    }
+
+    private func compareDevicesForDisplay(_ left: Device, _ right: Device) -> Bool {
+        let runtimeComparison = compareRuntimeVersions(left.runtime, right.runtime)
+        if runtimeComparison != 0 {
+            return runtimeComparison > 0
+        }
+
+        return left.name < right.name
+    }
+
+    private func compareRuntimeVersions(_ left: String, _ right: String) -> Int {
+        let leftComponents = runtimeVersionComponents(left)
+        let rightComponents = runtimeVersionComponents(right)
+        let count = max(leftComponents.count, rightComponents.count)
+
+        for index in 0..<count {
+            let leftValue = index < leftComponents.count ? leftComponents[index] : 0
+            let rightValue = index < rightComponents.count ? rightComponents[index] : 0
+            if leftValue != rightValue {
+                return leftValue < rightValue ? -1 : 1
+            }
+        }
+
+        return 0
+    }
+
+    private func runtimeVersionComponents(_ runtime: String) -> [Int] {
+        runtime
+            .split(separator: " ")
+            .last?
+            .split(separator: ".")
+            .compactMap { Int($0) } ?? []
     }
 
     private func displayRuntime(_ identifier: String) -> String {
