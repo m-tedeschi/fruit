@@ -9,6 +9,12 @@ struct CommandResult {
     var succeeded: Bool { status == 0 }
 }
 
+struct BuildOptions {
+    let deviceArgument: String?
+    let verbose: Bool
+    let outputLogName: String?
+}
+
 enum FruitError: Error, CustomStringConvertible {
     case message(String)
 
@@ -44,18 +50,55 @@ struct Shell {
         return CommandResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
     }
 
-    static func stream(_ arguments: [String]) throws -> Int32 {
-        print(arguments.map(quote).joined(separator: " "))
+    static func stream(_ arguments: [String], outputFile: URL? = nil, printCommand: Bool = true) throws -> Int32 {
+        let outputHandle: FileHandle?
+        if let outputFile {
+            FileManager.default.createFile(atPath: outputFile.path, contents: nil)
+            outputHandle = try FileHandle(forWritingTo: outputFile)
+        } else {
+            outputHandle = nil
+        }
+        defer {
+            try? outputHandle?.close()
+        }
+
+        if printCommand {
+            let command = commandLine(arguments) + "\n"
+            print(command, terminator: "")
+            if let data = command.data(using: .utf8) {
+                outputHandle?.write(data)
+            }
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = arguments
-        process.standardOutput = FileHandle.standardOutput
-        process.standardError = FileHandle.standardError
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        let writeQueue = DispatchQueue(label: "fruit.stream.output")
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                return
+            }
+            writeQueue.sync {
+                FileHandle.standardOutput.write(data)
+                outputHandle?.write(data)
+            }
+        }
 
         try process.run()
         process.waitUntilExit()
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+
         return process.terminationStatus
+    }
+
+    static func commandLine(_ arguments: [String]) -> String {
+        arguments.map(quote).joined(separator: " ")
     }
 
     private static func quote(_ value: String) -> String {
@@ -87,14 +130,46 @@ struct Device: Codable {
 }
 
 struct FruitConfig: Codable {
-    let simulatorUDID: String
-    let simulatorName: String
-    let runtime: String
+    var simulatorUDID: String? = nil
+    var simulatorName: String? = nil
+    var runtime: String? = nil
+    var scheme: String? = nil
+}
+
+enum XcodeContainerKind: String {
+    case project
+    case workspace
+
+    var pathExtension: String {
+        switch self {
+        case .project: return "xcodeproj"
+        case .workspace: return "xcworkspace"
+        }
+    }
+
+    var xcodebuildFlag: String {
+        switch self {
+        case .project: return "-project"
+        case .workspace: return "-workspace"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .project: return "project"
+        case .workspace: return "workspace"
+        }
+    }
+}
+
+struct XcodeContainer {
+    let kind: XcodeContainerKind
+    let url: URL
 }
 
 struct ProjectContext {
     let root: URL
-    let project: URL
+    let container: XcodeContainer
     let fruitDirectory: URL
     let configFile: URL
     let derivedData: URL
@@ -134,10 +209,16 @@ struct Fruit {
             }
         case "schemes":
             try listSchemes()
+        case "scheme":
+            if let schemeName = rest.first {
+                try setScheme(schemeName)
+            } else {
+                try printCurrentScheme()
+            }
         case "build":
-            try build(deviceArgument: rest.first)
+            try build(options: parseBuildOptions(rest))
         case "run":
-            try runApp(deviceArgument: rest.first)
+            try runApp(options: parseBuildOptions(rest))
         case "clean":
             try clean()
         case "open":
@@ -160,12 +241,74 @@ struct Fruit {
           fruit device             Show the selected simulator
           fruit device <device>    Select a simulator by name or UDID
           fruit schemes            List Xcode schemes
+          fruit scheme             Show the selected scheme
+          fruit scheme <scheme>    Select an Xcode scheme
           fruit build [device]     Build for a simulator
+          fruit build --verbose    Build and stream xcodebuild output
+          fruit build --o log      Save xcodebuild output to .fruit/log
           fruit run [device]       Build, boot, reinstall, and launch
+          fruit run --verbose      Run and stream xcodebuild output
+          fruit run --o log        Save xcodebuild output to .fruit/log
           fruit clean              Remove .fruit/DerivedData
           fruit open               Open the project in Xcode
           fruit doctor             Check whether the project can run
         """)
+    }
+
+    private func parseBuildOptions(_ arguments: [String]) throws -> BuildOptions {
+        var verbose = false
+        var outputLogName: String?
+        var deviceArguments: [String] = []
+        var index = 0
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--verbose", "-v":
+                verbose = true
+            case "--o":
+                index += 1
+                guard index < arguments.count else {
+                    throw FruitError.message("missing file after `--o`")
+                }
+                guard !arguments[index].hasPrefix("-") else {
+                    throw FruitError.message("missing file after `--o`")
+                }
+                outputLogName = try validatedOutputLogName(arguments[index])
+            default:
+                if argument.hasPrefix("-") {
+                    throw FruitError.message("unknown option `\(argument)`")
+                }
+                deviceArguments.append(argument)
+            }
+            index += 1
+        }
+
+        if deviceArguments.count > 1 {
+            throw FruitError.message("expected at most one device argument")
+        }
+
+        return BuildOptions(deviceArgument: deviceArguments.first, verbose: verbose, outputLogName: outputLogName)
+    }
+
+    private func validatedOutputLogName(_ name: String) throws -> String {
+        let url = URL(fileURLWithPath: name)
+        let components = name.split(separator: "/").map(String.init)
+
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw FruitError.message("output log file cannot be empty")
+        }
+        guard !url.isFileURL || !name.hasPrefix("/") else {
+            throw FruitError.message("output log file must be relative to .fruit")
+        }
+        guard !components.contains("..") else {
+            throw FruitError.message("output log file cannot contain `..`")
+        }
+        guard !components.contains(".") else {
+            throw FruitError.message("output log file cannot contain `.` path components")
+        }
+
+        return name
     }
 
     private func listDevices() throws {
@@ -251,13 +394,21 @@ struct Fruit {
         }
 
         let devices = try availableDevices()
-        if devices.contains(where: { $0.udid == config.simulatorUDID }) {
-            print("\(config.simulatorName) (\(config.runtime))")
-            print(config.simulatorUDID)
+        guard let simulatorUDID = config.simulatorUDID,
+              let simulatorName = config.simulatorName,
+              let runtime = config.runtime else {
+            print("No selected device.")
+            print("Run `fruit devices`, then `fruit device <device>`.")
+            return
+        }
+
+        if devices.contains(where: { $0.udid == simulatorUDID }) {
+            print("\(simulatorName) (\(runtime))")
+            print(simulatorUDID)
         } else {
             print("Saved device no longer exists:")
-            print("\(config.simulatorName) (\(config.runtime))")
-            print(config.simulatorUDID)
+            print("\(simulatorName) (\(runtime))")
+            print(simulatorUDID)
             print("")
             print("Run `fruit devices`, then `fruit device <device>`.")
         }
@@ -268,13 +419,11 @@ struct Fruit {
         let device = try resolveNamedDevice(deviceName)
         try fileManager.createDirectory(at: context.fruitDirectory, withIntermediateDirectories: true)
 
-        let config = FruitConfig(
-            simulatorUDID: device.udid,
-            simulatorName: device.name,
-            runtime: device.runtime
-        )
-        let data = try JSONEncoder.pretty.encode(config)
-        try data.write(to: context.configFile)
+        var config = try readConfig(context: context) ?? FruitConfig()
+        config.simulatorUDID = device.udid
+        config.simulatorName = device.name
+        config.runtime = device.runtime
+        try writeConfig(config, context: context)
 
         print("Selected \(device.name) (\(device.runtime))")
         print(device.udid)
@@ -287,39 +436,84 @@ struct Fruit {
         }
     }
 
-    private func build(deviceArgument: String?) throws {
+    private func printCurrentScheme() throws {
         let context = try discoverProject()
-        let scheme = try defaultScheme(context: context)
-        let device = try resolveDevice(deviceArgument: deviceArgument, context: context)
-        try build(context: context, scheme: scheme, device: device)
+        let foundSchemes = try schemes(context: context)
+        guard let selectedScheme = try readConfig(context: context)?.scheme else {
+            if foundSchemes.count == 1 {
+                print(foundSchemes[0])
+                print("(inferred: only available scheme)")
+            } else {
+                print("No selected scheme.")
+                print("Run `fruit schemes`, then `fruit scheme <scheme>`.")
+            }
+            return
+        }
+
+        if foundSchemes.contains(selectedScheme) {
+            print(selectedScheme)
+        } else {
+            print("Saved scheme no longer exists: \(selectedScheme)")
+            print("Run `fruit schemes`, then `fruit scheme <scheme>`.")
+        }
     }
 
-    private func runApp(deviceArgument: String?) throws {
+    private func setScheme(_ schemeName: String) throws {
         let context = try discoverProject()
-        let scheme = try defaultScheme(context: context)
-        let device = try resolveDevice(deviceArgument: deviceArgument, context: context)
+        let foundSchemes = try schemes(context: context)
+        guard foundSchemes.contains(schemeName) else {
+            let choices = foundSchemes.map { "  \($0)" }.joined(separator: "\n")
+            throw FruitError.message("no scheme named `\(schemeName)`. Available schemes:\n\(choices)")
+        }
 
-        try build(context: context, scheme: scheme, device: device)
+        try fileManager.createDirectory(at: context.fruitDirectory, withIntermediateDirectories: true)
+        var config = try readConfig(context: context) ?? FruitConfig()
+        config.scheme = schemeName
+        try writeConfig(config, context: context)
 
+        print("Selected scheme \(schemeName)")
+    }
+
+    private func build(options: BuildOptions) throws {
+        let context = try discoverProject()
+        let scheme = try resolveScheme(context: context)
+        let device = try resolveDevice(deviceArgument: options.deviceArgument, context: context)
+        try build(context: context, scheme: scheme, device: device, options: options)
+    }
+
+    private func runApp(options: BuildOptions) throws {
+        let context = try discoverProject()
+        let scheme = try resolveScheme(context: context)
+        let device = try resolveDevice(deviceArgument: options.deviceArgument, context: context)
+
+        try build(context: context, scheme: scheme, device: device, options: options)
+
+        print("Booting \(device.name) (\(device.runtime))...")
         _ = try Shell.run(["xcrun", "simctl", "boot", device.udid])
         _ = try Shell.run(["open", "-a", "Simulator"])
 
         let appPath = try builtAppPath(context: context, scheme: scheme)
         let bundleID = try bundleIdentifier(context: context, scheme: scheme, device: device)
 
+        print("Reinstalling \(bundleID)...")
         _ = try Shell.run(["xcrun", "simctl", "uninstall", device.udid, bundleID])
 
-        let install = try Shell.run(["xcrun", "simctl", "install", device.udid, appPath.path], printCommand: true)
+        let install = try Shell.run(["xcrun", "simctl", "install", device.udid, appPath.path])
         guard install.succeeded else {
             throw FruitError.message("install failed:\n\(install.stderr)")
         }
 
-        let launch = try Shell.run(["xcrun", "simctl", "launch", device.udid, bundleID], printCommand: true)
+        print("Launching...")
+        let launch = try Shell.run(["xcrun", "simctl", "launch", device.udid, bundleID])
         guard launch.succeeded else {
             throw FruitError.message("launch failed:\n\(launch.stderr)")
         }
 
-        print(launch.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        let launchOutput = launch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !launchOutput.isEmpty {
+            print(launchOutput)
+        }
+        print("Run succeeded.")
     }
 
     private func clean() throws {
@@ -334,9 +528,9 @@ struct Fruit {
 
     private func openProject() throws {
         let context = try discoverProject()
-        let result = try Shell.run(["open", context.project.path], printCommand: true)
+        let result = try Shell.run(["open", context.container.url.path], printCommand: true)
         guard result.succeeded else {
-            throw FruitError.message("failed to open project:\n\(result.stderr)")
+            throw FruitError.message("failed to open \(context.container.kind.displayName):\n\(result.stderr)")
         }
     }
 
@@ -360,27 +554,35 @@ struct Fruit {
         let context: ProjectContext
         do {
             context = try discoverProject()
-            print("  ok     found project: \(context.project.lastPathComponent)")
+            print("  ok     found \(context.container.kind.displayName): \(context.container.url.lastPathComponent)")
         } catch {
             print("  error  \(error)")
             print("\nFix")
-            print("  cd into an Xcode project directory.")
+            print("  cd into an Xcode project or workspace directory.")
             exit(1)
         }
 
         let scheme: String?
         do {
             let foundSchemes = try schemes(context: context)
-            if foundSchemes.count == 1 {
+            let selectedScheme = try readConfig(context: context)?.scheme
+            if let selectedScheme, foundSchemes.contains(selectedScheme) {
+                scheme = selectedScheme
+                print("  ok     selected scheme: \(selectedScheme)")
+            } else if let selectedScheme {
+                scheme = nil
+                print("  error  saved scheme no longer exists: \(selectedScheme)")
+                hasError = true
+            } else if foundSchemes.count == 1 {
                 scheme = foundSchemes[0]
-                print("  ok     found scheme: \(foundSchemes[0])")
+                print("  ok     inferred scheme: \(foundSchemes[0])")
             } else if foundSchemes.isEmpty {
                 scheme = nil
                 print("  error  no schemes found")
                 hasError = true
             } else {
                 scheme = nil
-                print("  error  multiple schemes found: \(foundSchemes.joined(separator: ", "))")
+                print("  error  multiple schemes found and no scheme is selected: \(foundSchemes.joined(separator: ", "))")
                 hasError = true
             }
         } catch {
@@ -424,9 +626,12 @@ struct Fruit {
             hasError = true
         }
 
-        if let config = try readConfig(context: context) {
-            if devices.contains(where: { $0.udid == config.simulatorUDID }) {
-                print("  ok     saved simulator: \(config.simulatorName) (\(config.runtime))")
+        let config = try readConfig(context: context)
+        if let simulatorUDID = config?.simulatorUDID {
+            if let simulatorName = config?.simulatorName,
+               let runtime = config?.runtime,
+               devices.contains(where: { $0.udid == simulatorUDID }) {
+                print("  ok     saved simulator: \(simulatorName) (\(runtime))")
             } else {
                 print("  error  saved simulator no longer exists")
                 hasError = true
@@ -446,6 +651,7 @@ struct Fruit {
 
         if hasError {
             print("\nFix")
+            print("  Run `fruit schemes`, then `fruit scheme <scheme>` if no scheme is selected.")
             print("  Run `fruit devices`, then `fruit device <device>` if no simulator is selected.")
             exit(1)
         } else {
@@ -466,22 +672,87 @@ struct Fruit {
         return false
     }
 
-    private func build(context: ProjectContext, scheme: String, device: Device) throws {
+    private func build(context: ProjectContext, scheme: String, device: Device, options: BuildOptions) throws {
         try fileManager.createDirectory(at: context.derivedData, withIntermediateDirectories: true)
 
-        let status = try Shell.stream([
+        print("Building \(scheme) for \(device.name) (\(device.runtime))...")
+
+        let outputFile = try options.outputLogName.map { try outputLogURL(named: $0, context: context) }
+        let arguments = [
             "xcodebuild",
-            "-project", context.project.path,
+        ] + xcodebuildContainerArguments(context: context) + [
             "-scheme", scheme,
             "-configuration", "Debug",
             "-destination", "platform=iOS Simulator,id=\(device.udid)",
             "-derivedDataPath", context.derivedData.path,
             "build"
-        ])
+        ]
 
-        guard status == 0 else {
-            throw FruitError.message("build failed")
+        if options.verbose {
+            let status = try Shell.stream(arguments, outputFile: outputFile)
+            if let outputFile {
+                print("Saved build log to \(relativePath(outputFile, from: context.root))")
+            }
+            guard status == 0 else {
+                throw FruitError.message("build failed with exit code \(status)")
+            }
+            print("Build succeeded.")
+            return
         }
+
+        let result = try Shell.run(arguments)
+        if let outputFile {
+            try writeBuildLog(result: result, arguments: arguments, to: outputFile)
+            print("Saved build log to \(relativePath(outputFile, from: context.root))")
+        }
+
+        guard result.succeeded else {
+            throw FruitError.message(buildFailureMessage(result))
+        }
+
+        print("Build succeeded.")
+    }
+
+    private func outputLogURL(named name: String, context: ProjectContext) throws -> URL {
+        let components = name.split(separator: "/").map(String.init)
+        var url = context.fruitDirectory
+        for component in components {
+            url.appendPathComponent(component)
+        }
+
+        let parent = url.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func writeBuildLog(result: CommandResult, arguments: [String], to outputFile: URL) throws {
+        var output = Shell.commandLine(arguments) + "\n"
+        if !result.stdout.isEmpty {
+            output += result.stdout
+        }
+        if !result.stderr.isEmpty {
+            if !output.hasSuffix("\n") {
+                output += "\n"
+            }
+            output += result.stderr
+        }
+        try output.write(to: outputFile, atomically: true, encoding: .utf8)
+    }
+
+    private func buildFailureMessage(_ result: CommandResult) -> String {
+        let output = [result.stdout, result.stderr]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n")
+
+        let lines = output.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+        let tail = lines.suffix(80).joined(separator: "\n")
+        if tail.isEmpty {
+            return "build failed with exit code \(result.status)"
+        }
+
+        return "build failed:\n\(tail)"
     }
 
     private func builtAppPath(context: ProjectContext, scheme: String) throws -> URL {
@@ -512,7 +783,8 @@ struct Fruit {
         let devices = try availableDevices()
 
         if let config = try readConfig(context: context),
-           let selected = devices.first(where: { $0.udid == config.simulatorUDID }) {
+           let simulatorUDID = config.simulatorUDID,
+           let selected = devices.first(where: { $0.udid == simulatorUDID }) {
             return selected
         }
 
@@ -598,23 +870,24 @@ struct Fruit {
         var directory = URL(fileURLWithPath: fileManager.currentDirectoryPath)
 
         while true {
-            let projects = try fileManager.contentsOfDirectory(
+            let contents = try fileManager.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )
-            .filter { $0.pathExtension == "xcodeproj" }
 
+            let workspaces = contents.filter { $0.pathExtension == XcodeContainerKind.workspace.pathExtension }
+            if workspaces.count == 1 {
+                return projectContext(root: directory, container: XcodeContainer(kind: .workspace, url: workspaces[0]))
+            }
+
+            if workspaces.count > 1 {
+                throw FruitError.message("multiple .xcworkspace files found in \(directory.path)")
+            }
+
+            let projects = contents.filter { $0.pathExtension == XcodeContainerKind.project.pathExtension }
             if projects.count == 1 {
-                let root = directory
-                let fruitDirectory = root.appendingPathComponent(".fruit")
-                return ProjectContext(
-                    root: root,
-                    project: projects[0],
-                    fruitDirectory: fruitDirectory,
-                    configFile: fruitDirectory.appendingPathComponent("config.json"),
-                    derivedData: fruitDirectory.appendingPathComponent("DerivedData")
-                )
+                return projectContext(root: directory, container: XcodeContainer(kind: .project, url: projects[0]))
             }
 
             if projects.count > 1 {
@@ -628,11 +901,54 @@ struct Fruit {
             directory = parent
         }
 
-        throw FruitError.message("no .xcodeproj found in current directory or parents")
+        throw FruitError.message("no .xcworkspace or .xcodeproj found in current directory or parents")
+    }
+
+    private func projectContext(root: URL, container: XcodeContainer) -> ProjectContext {
+        let fruitDirectory = root.appendingPathComponent(".fruit")
+        return ProjectContext(
+            root: root,
+            container: container,
+            fruitDirectory: fruitDirectory,
+            configFile: fruitDirectory.appendingPathComponent("config.json"),
+            derivedData: fruitDirectory.appendingPathComponent("DerivedData")
+        )
+    }
+
+    private func xcodebuildContainerArguments(context: ProjectContext) -> [String] {
+        [context.container.kind.xcodebuildFlag, context.container.url.path]
     }
 
     private func schemes(context: ProjectContext) throws -> [String] {
-        let result = try Shell.run(["xcodebuild", "-list", "-project", context.project.path])
+        let sharedSchemes = try sharedSchemes(context: context)
+        if !sharedSchemes.isEmpty {
+            return sharedSchemes
+        }
+
+        return try xcodebuildSchemes(context: context)
+    }
+
+    private func sharedSchemes(context: ProjectContext) throws -> [String] {
+        let schemesDirectory = context.container.url
+            .appendingPathComponent("xcshareddata")
+            .appendingPathComponent("xcschemes")
+
+        guard fileManager.fileExists(atPath: schemesDirectory.path) else {
+            return []
+        }
+
+        return try fileManager.contentsOfDirectory(
+            at: schemesDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { $0.pathExtension == "xcscheme" }
+        .map { $0.deletingPathExtension().lastPathComponent }
+        .sorted()
+    }
+
+    private func xcodebuildSchemes(context: ProjectContext) throws -> [String] {
+        let result = try Shell.run(["xcodebuild", "-list"] + xcodebuildContainerArguments(context: context))
         guard result.succeeded else {
             throw FruitError.message(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         }
@@ -657,15 +973,21 @@ struct Fruit {
         return schemes
     }
 
-    private func defaultScheme(context: ProjectContext) throws -> String {
+    private func resolveScheme(context: ProjectContext) throws -> String {
         let foundSchemes = try schemes(context: context)
+        if let selectedScheme = try readConfig(context: context)?.scheme {
+            if foundSchemes.contains(selectedScheme) {
+                return selectedScheme
+            }
+            throw FruitError.message("saved scheme no longer exists: \(selectedScheme). Run `fruit schemes`, then `fruit scheme <scheme>`.")
+        }
         if foundSchemes.count == 1 {
             return foundSchemes[0]
         }
         if foundSchemes.isEmpty {
             throw FruitError.message("no schemes found")
         }
-        throw FruitError.message("multiple schemes found: \(foundSchemes.joined(separator: ", ")). Version 0 requires exactly one scheme.")
+        throw FruitError.message("multiple schemes found: \(foundSchemes.joined(separator: ", ")). Run `fruit scheme <scheme>`.")
     }
 
     private func bundleIdentifier(context: ProjectContext, scheme: String, device: Device) throws -> String {
@@ -675,7 +997,7 @@ struct Fruit {
 
         let result = try Shell.run([
             "xcodebuild",
-            "-project", context.project.path,
+        ] + xcodebuildContainerArguments(context: context) + [
             "-scheme", scheme,
             "-configuration", "Debug",
             "-destination", "platform=iOS Simulator,id=\(device.udid)",
@@ -694,7 +1016,11 @@ struct Fruit {
     }
 
     private func bundleIdentifierFromProjectFile(context: ProjectContext) throws -> String? {
-        let pbxproj = context.project.appendingPathComponent("project.pbxproj")
+        guard context.container.kind == .project else {
+            return nil
+        }
+
+        let pbxproj = context.container.url.appendingPathComponent("project.pbxproj")
         let contents = try String(contentsOf: pbxproj, encoding: .utf8)
         for line in contents.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -714,6 +1040,12 @@ struct Fruit {
 
         let data = try Data(contentsOf: context.configFile)
         return try JSONDecoder().decode(FruitConfig.self, from: data)
+    }
+
+    private func writeConfig(_ config: FruitConfig, context: ProjectContext) throws {
+        try fileManager.createDirectory(at: context.fruitDirectory, withIntermediateDirectories: true)
+        let data = try JSONEncoder.pretty.encode(config)
+        try data.write(to: context.configFile)
     }
 
     private func relativePath(_ url: URL, from root: URL) -> String {

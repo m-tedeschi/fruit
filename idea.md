@@ -16,6 +16,8 @@ Usage / Commands:
 * `fruit device`: displays the current selected device
 * `fruit device <device>`: sets the selected device
 * `fruit schemes`: lists Xcode schemes of the current project
+* `fruit scheme`: displays the current selected scheme
+* `fruit scheme <scheme>`: sets the selected scheme
 * `fruit build`: builds the app using sane defaults
 * `fruit build <device>`: builds the app using sane defaults for device
 * `fruit run`: build for selected device, boot simulator (if it's not running already), install the
@@ -31,10 +33,12 @@ Usage / Commands:
 ## Version 0 Constraints
 
 * simulator devices only
-* supports one `.xcodeproj` in the current project tree
-* if multiple schemes exist, version 0 requires the user to choose later;
-  version 0 uses the only scheme when exactly one scheme exists
-* `.xcworkspace` detection may be doctor-only until workspace builds are implemented
+* supports one `.xcworkspace` or one `.xcodeproj` in the current project tree
+* prefers a single `.xcworkspace` when present, because CocoaPods projects should
+  build through the workspace
+* if multiple schemes exist, version 0 requires the user to choose with
+  `fruit scheme <scheme>`; version 0 uses the only scheme when exactly one
+  scheme exists
 * `fruit logs` is omitted from version 0
 
 ## Device Resolution
@@ -46,6 +50,19 @@ Fruit resolves the device in this order:
 2. saved device in `.fruit/config.json`, if valid
 3. exactly one booted simulator, if present
 4. fail with a helpful message that suggests `fruit devices` or `fruit device <device>`
+
+## Scheme Resolution
+
+For commands that need an Xcode scheme, such as `fruit build` and `fruit run`,
+Fruit resolves the scheme in this order:
+
+1. saved scheme in `.fruit/config.json`, if valid
+2. exactly one available scheme, if present
+3. fail with a helpful message that suggests `fruit schemes` or `fruit scheme <scheme>`
+
+Fruit should read shared scheme files directly from the selected project or
+workspace when possible, and fall back to `xcodebuild -list` only when no shared
+schemes are found.
 
 ## Doctor
 
@@ -62,6 +79,7 @@ Checks should include:
 * available iPhone simulators
 * current `.xcodeproj` or `.xcworkspace`
 * available schemes
+* saved selected scheme still exists, if configured
 * inferred app bundle identifier
 * `.fruit/config.json` exists and is valid JSON, if present
 * saved selected simulator UDID still exists, if configured
