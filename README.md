@@ -95,6 +95,8 @@ Expected output:
 | Command | Description |
 | --- | --- |
 | `fruit` | Show help. |
+| `fruit version` | Show the installed Fruit version. |
+| `fruit --version` | Show the installed Fruit version. |
 | `fruit devices` | List available iOS simulators. |
 | `fruit device` | Show the selected simulator. |
 | `fruit device <device>` | Select a simulator by name or UDID. |
